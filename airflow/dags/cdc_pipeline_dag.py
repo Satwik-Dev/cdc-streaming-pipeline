@@ -14,9 +14,6 @@ from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
 from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.apache.kafka.hooks.kafka import KafkaHook
-from airflow.providers.apache.hdfs.hooks.hdfs import HDFSHook
-from airflow.providers.apache.hive.hooks.hive import HiveCliHook
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.models import Variable
 
@@ -167,25 +164,6 @@ def configure_debezium_connector():
     return True
 
 
-def create_hdfs_sink_directory():
-    """Create HDFS directory for CDC sink."""
-    hdfs_hook = HDFSHook(hdfs_conn_id='hdfs_default')
-    hdfs = hdfs_hook.get_conn()
-    
-    # Create directory if it doesn't exist
-    if not hdfs.exists(HDFS_SINK_PATH):
-        hdfs.mkdir(HDFS_SINK_PATH)
-        print(f"Created HDFS directory: {HDFS_SINK_PATH}")
-    
-    # Create empty file if it doesn't exist
-    sink_file_path = f"{HDFS_SINK_PATH}/{HDFS_SINK_FILE}"
-    if not hdfs.exists(sink_file_path):
-        hdfs.write(sink_file_path, b'')
-        print(f"Created HDFS sink file: {sink_file_path}")
-    
-    return True
-
-
 def configure_hdfs_sink_connector():
     """Configure HDFS Sink connector for Kafka Connect."""
     # Check if connector exists
@@ -291,56 +269,31 @@ def check_connector_status():
     return True
 
 
-def create_hive_table():
-    """Create Hive table for CDC data."""
-    hive_hook = HiveCliHook(hive_cli_conn_id='hive_cli_default')
+def monitor_kafka_topics():
+    """Monitor Kafka topics."""
+    # Create kafka command to get topic information
+    from kafka import KafkaConsumer
     
-    # Create database if it doesn't exist
-    hive_hook.run_cli(f"CREATE DATABASE IF NOT EXISTS cdc_db")
-    
-    # Create table if it doesn't exist
-    hive_hook.run_cli(f"""
-        CREATE EXTERNAL TABLE IF NOT EXISTS cdc_db.cdc_events (
-            id INT,
-            name STRING,
-            email STRING,
-            address STRING,
-            created_at TIMESTAMP,
-            updated_at TIMESTAMP,
-            description STRING,
-            price DECIMAL(10,2),
-            stock INT,
-            category STRING,
-            status STRING,
-            customer_id INT,
-            order_date TIMESTAMP,
-            total_amount DECIMAL(12,2),
-            shipping_address STRING,
-            product_id INT,
-            quantity INT,
-            unit_price DECIMAL(10,2),
-            order_id INT,
-            op STRING,
-            table_name STRING,
-            lsn STRING
-        )
-        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.JsonSerDe'
-        STORED AS TEXTFILE
-        LOCATION 'hdfs://namenode:9000{HDFS_SINK_PATH}'
-        TBLPROPERTIES ('serialization.format'='1');
-    """)
-    
-    return True
-
-
-def check_hdfs_sink_file():
-    """Check if the HDFS sink file exists and is accessible."""
-    hdfs_hook = HDFSHook(hdfs_conn_id='hdfs_default')
-    hdfs = hdfs_hook.get_conn()
-    
-    sink_file_path = f"{HDFS_SINK_PATH}/{HDFS_SINK_FILE}"
-    if not hdfs.exists(sink_file_path):
-        raise ValueError(f"HDFS sink file {sink_file_path} not found")
+    # Create consumers for all topics
+    consumers = {}
+    for table in CDC_TABLES:
+        topic_name = f"cdc.{POSTGRES_DB}.test_schema.{table}"
+        try:
+            consumer = KafkaConsumer(
+                topic_name,
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                auto_offset_reset='latest',
+                group_id=f'airflow-monitor-{table}',
+                consumer_timeout_ms=5000  # 5 seconds timeout
+            )
+            partitions = consumer.partitions_for_topic(topic_name)
+            if partitions:
+                print(f"Topic {topic_name} has {len(partitions)} partitions")
+            else:
+                print(f"Warning: No partitions found for topic {topic_name}")
+            consumer.close()
+        except Exception as e:
+            print(f"Error monitoring topic {topic_name}: {e}")
     
     return True
 
@@ -348,53 +301,6 @@ def check_hdfs_sink_file():
 def run_test_data_generator():
     """Run the test data generator to produce CDC events."""
     # This function will kick off the test data generator container
-    return True
-
-
-def monitor_pipeline():
-    """Monitor the CDC pipeline and log status."""
-    # Monitor Kafka topics
-    from kafka import KafkaConsumer
-    
-    # Create consumers for all topics
-    consumers = {}
-    for table in CDC_TABLES:
-        topic_name = f"cdc.{POSTGRES_DB}.test_schema.{table}"
-        consumer = KafkaConsumer(
-            topic_name,
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            auto_offset_reset='latest',
-            enable_auto_commit=True,
-            group_id=f'airflow-monitor-{table}',
-            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-        consumers[topic_name] = consumer
-    
-    # Check if topics have messages
-    for topic_name, consumer in consumers.items():
-        partitions = consumer.partitions_for_topic(topic_name)
-        if not partitions:
-            print(f"Warning: No partitions found for topic {topic_name}")
-            continue
-        
-        # Get topic info
-        print(f"Monitoring topic: {topic_name}")
-        
-        # Close consumer
-        consumer.close()
-    
-    # Check HDFS file
-    hdfs_hook = HDFSHook(hdfs_conn_id='hdfs_default')
-    hdfs = hdfs_hook.get_conn()
-    
-    sink_file_path = f"{HDFS_SINK_PATH}/{HDFS_SINK_FILE}"
-    if hdfs.exists(sink_file_path):
-        file_info = hdfs.info(sink_file_path)
-        file_size = file_info.get('size', 0)
-        print(f"HDFS sink file size: {file_size} bytes")
-    else:
-        print(f"Warning: HDFS sink file {sink_file_path} not found")
-    
     return True
 
 
@@ -411,9 +317,14 @@ create_topics = PythonOperator(
     dag=dag,
 )
 
-create_hdfs_dir = PythonOperator(
+create_hdfs_dir = BashOperator(
     task_id='create_hdfs_directory',
-    python_callable=create_hdfs_sink_directory,
+    bash_command=f"""
+        hdfs dfs -test -e {HDFS_SINK_PATH} || hdfs dfs -mkdir -p {HDFS_SINK_PATH}
+        hdfs dfs -test -e {HDFS_SINK_PATH}/{HDFS_SINK_FILE} || hdfs dfs -touchz {HDFS_SINK_PATH}/{HDFS_SINK_FILE}
+        hdfs dfs -chmod -R 777 {HDFS_SINK_PATH}
+        echo "HDFS directory and file created successfully"
+    """,
     dag=dag,
 )
 
@@ -441,15 +352,51 @@ check_connectors = PythonOperator(
     dag=dag,
 )
 
-setup_hive = PythonOperator(
+create_hive_table = BashOperator(
     task_id='create_hive_table',
-    python_callable=create_hive_table,
+    bash_command=f"""
+        beeline -u "jdbc:hive2://hive-server:10000" -e "
+        CREATE DATABASE IF NOT EXISTS cdc_db;
+        CREATE EXTERNAL TABLE IF NOT EXISTS cdc_db.cdc_events (
+            id INT,
+            name STRING,
+            email STRING,
+            address STRING,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            description STRING,
+            price DECIMAL(10,2),
+            stock INT,
+            category STRING,
+            status STRING,
+            customer_id INT,
+            order_date TIMESTAMP,
+            total_amount DECIMAL(12,2),
+            shipping_address STRING,
+            product_id INT,
+            quantity INT,
+            unit_price DECIMAL(10,2),
+            order_id INT,
+            op STRING,
+            table_name STRING,
+            lsn STRING
+        )
+        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.JsonSerDe'
+        STORED AS TEXTFILE
+        LOCATION 'hdfs://namenode:9000{HDFS_SINK_PATH}'
+        TBLPROPERTIES ('serialization.format'='1');"
+        echo "Hive table created successfully"
+    """,
     dag=dag,
 )
 
-check_hdfs = PythonOperator(
+check_hdfs = BashOperator(
     task_id='check_hdfs_sink_file',
-    python_callable=check_hdfs_sink_file,
+    bash_command=f"""
+        hdfs dfs -test -e {HDFS_SINK_PATH}/{HDFS_SINK_FILE} || exit 1
+        echo "HDFS sink file exists: {HDFS_SINK_PATH}/{HDFS_SINK_FILE}"
+        hdfs dfs -ls {HDFS_SINK_PATH}
+    """,
     dag=dag,
 )
 
@@ -459,9 +406,21 @@ run_test_generator = PythonOperator(
     dag=dag,
 )
 
-monitor = PythonOperator(
+monitor = BashOperator(
     task_id='monitor_pipeline',
-    python_callable=monitor_pipeline,
+    bash_command=f"""
+        echo "Monitoring Kafka topics..."
+        kafka-topics --bootstrap-server {KAFKA_BOOTSTRAP_SERVERS} --list | grep cdc
+        
+        echo "Checking HDFS sink file..."
+        hdfs dfs -ls {HDFS_SINK_PATH}
+        
+        echo "Checking connector status..."
+        curl -s http://kafka-connect:8083/connectors/{CDC_CONNECTOR_NAME}/status | grep state
+        curl -s http://kafka-connect:8083/connectors/hdfs-sink-connector/status | grep state
+        
+        echo "Pipeline monitoring complete"
+    """,
     dag=dag,
 )
 
@@ -470,4 +429,4 @@ check_postgres >> create_topics >> configure_cdc
 check_postgres >> create_hdfs_dir >> configure_hdfs_sink
 configure_cdc >> check_kafka
 configure_hdfs_sink >> check_connectors
-[check_kafka, check_connectors] >> setup_hive >> check_hdfs >> run_test_generator >> monitor
+[check_kafka, check_connectors] >> create_hive_table >> check_hdfs >> run_test_generator >> monitor
